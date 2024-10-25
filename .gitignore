@@ -1,0 +1,11 @@
+
+# pixi environments
+.pixi
+*.egg-info
+
+# Python Bytecode
+__pycache__/
+*.py[cod]
+
+# Lock Files
+*.lock

@@ -37,14 +37,14 @@ class ufpf:
           - Parsed dataframes for plate information and OD values
           - Methods to read and process the data
     """        
-    def __init__(self, path):
+    def __init__(self, path, timepoint_in_sheetnames=False):
         self.path = path
         self.number_of_plates = None
         self.plate_info = None
         self.OD = None
-        self.read_data()
+        self.read_data(timepoint_in_sheetnames)
     
-    def read_data(self):
+    def read_data(self, timepoint_in_sheetnames=False):
         # Get the number of sheets in the excel file
         self.number_of_plates = len(pd.ExcelFile(self.path).sheet_names)
         # For loop over each sheet read them into a dataframe
@@ -76,10 +76,15 @@ class ufpf:
                 well_rows = {1:'A', 2:'B', 3:'C', 4:'D', 5:'E', 6:'F', 7:'G', 8:'H'}
                 info_long['Well'] = info_long['Row'].map(well_rows) + info_long['Column'].astype(str)
                 infos[block_name] = info_long
-
+  
             # 3. Merge all plate info into single table
             plate_info = pd.merge(infos['Antibiotic'],infos['Dose'], on=['Plate_ID', 'Well', 'Row', 'Column'])
             plate_info = pd.merge(plate_info, infos['Strain'], on=['Plate_ID', 'Well', 'Row', 'Column'])
+            
+            # If there is timepoint data provided in sheetnames, append this to strain names
+            if timepoint_in_sheetnames:
+                plate_info['Strain'] = plate_info['Strain'].astype(str) + '_' + sheet_name.split('_')[-1]
+                plate_info.loc[plate_info['Strain'].str.contains('nan'), 'Strain'] = 'nan'
 
             # 4. Stack all plates into one table
             if self.plate_info is None:
@@ -517,7 +522,7 @@ class static:
 
     # Function to fit model and return EC50 estimate
     def fit_model(x_data, y_data, p0):
-        return least_squares(static.residuals, p0, args=(x_data, y_data), method='dogbox', loss='cauchy')
+        return least_squares(static.residuals, p0, args=(x_data, y_data), method='dogbox', loss='soft_l1')
     
     def bootstrap_resample(x_data, y_data, p0, seed=42):
         np.random.seed(seed)
@@ -738,8 +743,8 @@ class static:
         mic_text, mic_float, plot_mic = display_value(MIC)
         # Display dagger symbol if insufficient drug flag is true
         dagger_text = '†' if insufficient_drug else ''
-        ax.text(0.72, 0.88, f'IC50{dagger_text}: {ic50_text}', transform=ax.transAxes, fontsize=9, fontweight='bold', color='magenta', horizontalalignment='center')
-        ax.text(0.72, 0.76, f'MIC{dagger_text}: {mic_text}', transform=ax.transAxes, fontsize=9, fontweight='bold', color='blue', horizontalalignment='center')
+        ax.text(0.99, 0.9, f'IC50{dagger_text}: {ic50_text}', transform=ax.transAxes, fontsize=9, fontweight='bold', color='magenta', horizontalalignment='right')
+        ax.text(0.99, 0.8, f'MIC{dagger_text}: {mic_text}', transform=ax.transAxes, fontsize=9, fontweight='bold', color='blue', horizontalalignment='right')
         # ci_upper = float(result_data['IC50_ci_upper'])
 
         # # Print R_squared value

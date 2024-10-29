@@ -195,11 +195,13 @@ class static:
         df_results = pd.DataFrame(results)
         return df_results
     
-    def convert_OD_plate_to_long(df_OD_raw,  plate_numbers):
+    def convert_OD_plate_to_long(df_OD_raw,  df_plate_info):
         """ Extract data blocks for each plate and map to the wells along with corresponding Plate_IDs 
         Blocks of data are organized in stacked 8 by 12 arrays as input, they are converted to long format. 
         This is a necessary step.
         """
+        
+        unique_plates, plate_numbers = static.get_unique_plate_ids(df_plate_info)
         # Initialize an empty list to collect DataFrame slices
         results = []
 

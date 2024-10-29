@@ -14,8 +14,20 @@ requires = ["hatchling"]
 packages = ["plategig"]
 
 [tool.pixi.project]
+name = "plategig"
 channels = ["conda-forge"]
-platforms = ["linux-64", "win-64", "osx-arm64"]
+platforms = ["linux-64"]
+
+# Set for BioHPC at 20241029
+# uname -a
+# Linux NucleusA047 3.10.0-1160.88.1.el7.x86_64 #1 SMP Sat Feb 18 13:27:00 UTC 2023 x86_64 x86_64 x86_64 GNU/Linux
+# cat /etc/os-release
+# NAME="Red Hat Enterprise Linux Server"
+# VERSION="7.9 (Maipo)"
+
+[tool.pixi.system-requirements]
+linux = "3.10.0"
+libc = { family = "glibc", version = "2.17" }
 
 [tool.pixi.dependencies]
 polars = "*"

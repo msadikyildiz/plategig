@@ -4,10 +4,10 @@ import math
 import warnings
 import matplotlib.pyplot as plt
 import numpy as np
-
+import multiprocessing as mp
+from functools import partial
 from scipy.optimize import least_squares
 from scipy.optimize import fsolve
-import multiprocessing as mp
 
 # Suppress specific runtime warnings that are expected in normal operation
 warnings.filterwarnings('ignore', category=RuntimeWarning)
@@ -526,7 +526,7 @@ class static:
     def fit_model(x_data, y_data, p0):
         return least_squares(static.residuals, p0, args=(x_data, y_data), method='dogbox', loss='soft_l1')
     
-    def bootstrap_resample(x_data, y_data, p0, seed=42):
+    def bootstrap_resample(x_data, y_data, p0, seed=42, mic_percentage=0.05):
         np.random.seed(seed)
         x_resampled = []
         y_resampled = []
@@ -543,12 +543,17 @@ class static:
         try:
             # Fit the model on the resampled data and store EC50 estimate
             optimizer = static.fit_model(x_resampled, y_resampled, p0)
-            return optimizer.x[0], optimizer.x[1]
+            ic50, hill_coeff = optimizer.x
+
+            # Calculate IC50 and MIC using the interpolated values
+            mic = log_logistic_2pl_solve(mic_percentage, optimizer.x, ic50)[0]
+
+            return ic50, hill_coeff, mic
         except Exception as e:
             return np.nan, np.nan
         
     
-    def robust_phenotyper(df_analysis, antibiotic, strain, mic_percentage=0.05):
+    def robust_phenotyper(df_analysis, antibiotic, strain, mic_percentage=0.05, n_bootstrap=1000, threads=8):
 
         dose_response_data = static.dose_response_data_selector(df_analysis, strain, antibiotic)
         x_data = np.asarray(dose_response_data['Dose'].to_numpy(), dtype=float)
@@ -556,7 +561,7 @@ class static:
         # # replicate the last data points to avoid the error in the curve fitting
         # x_data = np.append(x_data, x_data[-1]/(x_data[-1]/x_data[-2]))
         # y_data = np.append(y_data, y_data[-1])
-        max_growth_scale = dose_response_data.loc[dose_response_data['Dose']==dose_response_data['Dose'].min(),'OD_final'].median()
+        max_growth_scale = dose_response_data.loc[dose_response_data['Dose'] == dose_response_data['Dose'].min(), 'OD_final'].median()
         y_data = y_data / max_growth_scale
         
         try:
@@ -566,31 +571,38 @@ class static:
             optimizer = static.fit_model(x_data, y_data, p0)
             ic50, hill_coeff = optimizer.x
 
-            # Number of bootstrap samples
-            n_bootstrap = 1000
-
             # Store bootstrap estimates for EC50
             ic50_bootstrap = []
             hill_coeff_bootstrap = []
+            mic_bootstrap = []
 
             # Use multiprocessing Pool to parallelize the bootstrap resampling with starmap
-            with mp.Pool(processes=8) as pool:
-                results = pool.starmap(static.bootstrap_resample, [(x_data, y_data, p0, seed) for seed in range(n_bootstrap)])
+            with mp.Pool(processes=threads) as pool:
+                results = pool.starmap(partial(static.bootstrap_resample, mic_percentage=mic_percentage),
+                                       [(x_data, y_data, p0, seed) for seed in range(n_bootstrap)])
 
             # Collect results
-            for ic50_, hill_coeff_ in results:
+            for ic50_, hill_coeff_, mic_ in results:
                 ic50_bootstrap.append(ic50_)
                 hill_coeff_bootstrap.append(hill_coeff_)
+                mic_bootstrap.append(mic_)
 
             ic50_bootstrap = np.array(ic50_bootstrap)
             hill_coeff_bootstrap = np.array(hill_coeff_bootstrap)
+            mic_bootstrap = np.array(mic_bootstrap)
+
             # get rid of floating point overflow errors
             filtered_ic50_bootstrap = ic50_bootstrap[abs(ic50_bootstrap)<1e20]
             filtered_hill_coeff_bootstrap = hill_coeff_bootstrap[abs(ic50_bootstrap)<1e20]
+            filtered_mic_bootstrap = mic_bootstrap[abs(ic50_bootstrap)<1e20]
 
             # Compute the confidence interval (e.g., 95% confidence interval, 2.5th and 97.5th percentiles)
-            ci_lower = np.percentile(filtered_ic50_bootstrap, 2.5)
-            ci_upper = np.percentile(filtered_ic50_bootstrap, 97.5)
+            ic50_ci_lower = np.percentile(filtered_ic50_bootstrap, 2.5)
+            ic50_ci_upper = np.percentile(filtered_ic50_bootstrap, 97.5)
+
+            # Now same for mic
+            mic_ci_lower = np.percentile(filtered_mic_bootstrap, 2.5)
+            mic_ci_upper = np.percentile(filtered_mic_bootstrap, 97.5)
 
             # Generate a fine range of dose values for interpolation
             x_fit = np.logspace(np.log10(x_data.min()/2), np.log10(x_data.max()*2), 100)
@@ -604,8 +616,10 @@ class static:
                 return {"Status": "PASS", 
                         'IC50': ic50,
                         'MIC': mic,
-                        'IC50_ci_lower': ci_lower,
-                        'IC50_ci_upper': ci_upper,
+                        'IC50_ci_lower': ic50_ci_lower,
+                        'IC50_ci_upper': ic50_ci_upper,
+                        'MIC_ci_lower': mic_ci_lower,
+                        'MIC_ci_upper': mic_ci_upper,
                         'max_growth': max_growth_scale,
                         'hill_coeff': hill_coeff,
                         'ic50_threshold': log_logistic_2pl_(optimizer.x, ic50) * max_growth_scale,
@@ -618,8 +632,10 @@ class static:
                 return {"Status": "FAIL", 
                         'IC50': ic50,
                         'MIC': mic,
-                        'IC50_ci_lower': ci_lower,
-                        'IC50_ci_upper': ci_upper,
+                        'IC50_ci_lower': ic50_ci_lower,
+                        'IC50_ci_upper': ic50_ci_upper,
+                        'MIC_ci_lower': mic_ci_lower,
+                        'MIC_ci_upper': mic_ci_upper,
                         'max_growth': max_growth_scale,
                         'hill_coeff': hill_coeff,
                         'ic50_threshold': np.nan,
@@ -634,6 +650,8 @@ class static:
                     'MIC': np.nan,
                     'IC50_ci_lower': np.nan,
                     'IC50_ci_upper': np.nan,
+                    'MIC_ci_lower': np.nan,
+                    'MIC_ci_upper': np.nan,
                     'max_growth_scale': np.nan,
                     'hill_coeff': np.nan,
                     'ic50_threshold': np.nan,
@@ -669,6 +687,8 @@ class static:
                     capped.loc[ix, 'MIC'] = allowed_ic50_cap
                     capped.loc[ix, 'IC50_ci_upper'] = allowed_ic50_cap
                     capped.loc[ix, 'IC50_ci_lower'] = allowed_ic50_cap
+                    capped.loc[ix, 'MIC_ci_upper'] = allowed_ic50_cap
+                    capped.loc[ix, 'MIC_ci_lower'] = allowed_ic50_cap
                     capped.loc[ix, 'insufficient_drug'] = True
         return capped
     

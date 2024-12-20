@@ -782,10 +782,10 @@ class static:
         normalized_IC50 = 1 if not plot_ic50 else (np.log10(ic50_float) - np.log10(final_x_limits[0])) / (np.log10(final_x_limits[1]) - np.log10(final_x_limits[0]))
 
         # Drawing horizontal lines with dynamic xmax based on normalized values or full width
-        # ax.axhline(y=mic_threshold, color='blue', linestyle=':', xmin=0, xmax=normalized_MIC)
-        # ax.axhline(y=ic50_threshold, color='magenta', linestyle=':', xmin=0, xmax=normalized_IC50)
         ax.plot([final_x_limits[0], IC50], [ic50_threshold, ic50_threshold], color='magenta', linestyle=':', linewidth=0.85)
         ax.plot([IC50, IC50], [0, ic50_threshold], color='magenta', linestyle=':', linewidth=0.85)
+        ax.plot([final_x_limits[0], MIC], [mic_threshold, mic_threshold], color='blue', linestyle=':', linewidth=0.85)
+        ax.plot([MIC, MIC], [0, mic_threshold], color='blue', linestyle=':', linewidth=0.85)
 
         # if plot_ic50 and ic50_float:
         #     ax.axvline(x=ic50_float, color='magenta', linestyle=':', ymin=0, ymax=ic50_threshold/1.1)

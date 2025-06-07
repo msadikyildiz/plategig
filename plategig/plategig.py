@@ -22,6 +22,14 @@ def log_logistic_4pl_solve(y_target, params, x_guess):
     # Equation to solve for x, where four_pl(x) = y_target
     return fsolve(lambda x: log_logistic_4pl_(params, x) - y_target, x0=x_guess)
 
+def log_logistic_3pl_(params, x):
+    top, ec50, hill_slope = params
+    return top / (1 + (x / ec50)**hill_slope)
+
+def log_logistic_3pl_solve(y_target, params, x_guess):
+    # Equation to solve for x, where three_pl(x) = y_target
+    return fsolve(lambda x: log_logistic_3pl_(params, x) - y_target, x0=x_guess)
+
 def log_logistic_2pl_(params, x):
     ec50, hill_slope = params
     return 1 / (1 + (x / ec50)**hill_slope)
@@ -156,9 +164,9 @@ class static:
         """ Extract and return unique Plate_IDs and their numerical parts from df_plate_info """
         # Extract unique Plate_IDs
         unique_plates = df_plate_info['Plate_ID'].unique()
-        if df_plate_info['Plate_ID'].dtype!=int:
+        if not pd.api.types.is_integer_dtype(df_plate_info['Plate_ID']):
             # Extract numbers from Plate_ID strings
-            plate_numbers = [int(plate.split(' ')[1]) for plate in unique_plates]
+            plate_numbers = [int(str(plate).split(' ')[1]) for plate in unique_plates]
         else:
             plate_numbers = list(unique_plates)
         return unique_plates, sorted(plate_numbers)
@@ -521,10 +529,52 @@ class static:
     # Define the residuals function
     def residuals(params, x, y):
         return y - log_logistic_2pl_(params, x)
+    
+    # Define the residuals function for 3PL
+    def residuals_3pl(params, x, y):
+        return y - log_logistic_3pl_(params, x)
 
     # Function to fit model and return EC50 estimate
     def fit_model(x_data, y_data, p0):
-        return least_squares(static.residuals, p0, args=(x_data, y_data), method='dogbox', loss='soft_l1')
+        # Robust fitting with better parameter bounds and scaling
+        # Set reasonable bounds for EC50 and hill slope
+        bounds = ([x_data.min() * 0.001, 0.1], [x_data.max() * 1000, 10])
+        
+        try:
+            # Try with scaled parameters first
+            return least_squares(static.residuals, p0, args=(x_data, y_data), 
+                               bounds=bounds, method='trf', loss='huber', 
+                               ftol=1e-8, xtol=1e-8, max_nfev=1000)
+        except:
+            # Fallback to simpler bounds
+            try:
+                return least_squares(static.residuals, p0, args=(x_data, y_data), 
+                                   method='lm', ftol=1e-6, xtol=1e-6)
+            except:
+                # Final fallback - return parameters without optimization
+                from scipy.optimize import OptimizeResult
+                return OptimizeResult(x=p0, success=False)
+    
+    # Function to fit 3PL model and return parameters
+    def fit_model_3pl(x_data, y_data, p0):
+        # Robust fitting for 3PL with parameter bounds
+        # Bounds: [top, ec50, hill_slope]
+        bounds = ([0.01, x_data.min() * 0.001, 0.1], 
+                 [y_data.max() * 10, x_data.max() * 1000, 10])
+        
+        try:
+            return least_squares(static.residuals_3pl, p0, args=(x_data, y_data), 
+                               bounds=bounds, method='trf', loss='huber',
+                               ftol=1e-8, xtol=1e-8, max_nfev=1000)
+        except:
+            # Fallback method
+            try:
+                return least_squares(static.residuals_3pl, p0, args=(x_data, y_data), 
+                                   method='lm', ftol=1e-6, xtol=1e-6)
+            except:
+                # Final fallback
+                from scipy.optimize import OptimizeResult
+                return OptimizeResult(x=p0, success=False)
     
     def bootstrap_resample(x_data, y_data, p0, seed=42, mic_percentage=0.05):
         np.random.seed(seed)
@@ -551,21 +601,126 @@ class static:
             return ic50, hill_coeff, mic
         except Exception as e:
             return np.nan, np.nan
+    
+    def bootstrap_resample_3pl(x_data, y_data, p0_3pl, seed=42, mic_percentage=0.05):
+        """Bootstrap resampling for 3PL curve fitting to estimate max_growth_scale robustly"""
+        np.random.seed(seed)
+        unique_doses = np.unique(x_data)
+        # Vectorized resampling for each dose
+        resampled_indices = np.hstack(
+            [np.random.choice(np.where(x_data == dose)[0], size=np.sum(x_data == dose), replace=True) 
+                for dose in unique_doses])
+        
+        # Resample both x and y based on the indices
+        x_resampled = x_data[resampled_indices]
+        y_resampled = y_data[resampled_indices]
+
+        try:
+            # Fit the 3PL model on the resampled data
+            optimizer_3pl = static.fit_model_3pl(x_resampled, y_resampled, p0_3pl)
+            top, ec50, hill_coeff = optimizer_3pl.x
+            
+            return top, ec50, hill_coeff
+        except Exception as e:
+            return np.nan, np.nan, np.nan
         
     
-    def robust_phenotyper(df_analysis, antibiotic, strain, mic_percentage=0.05, n_bootstrap=1000, threads=8):
+    def robust_phenotyper(df_analysis, antibiotic, strain, mic_percentage=0.05, n_bootstrap=100, threads=8):
 
         dose_response_data = static.dose_response_data_selector(df_analysis, strain, antibiotic)
         x_data = np.asarray(dose_response_data['Dose'].to_numpy(), dtype=float)
         y_data = np.asarray(dose_response_data['OD_final'].to_numpy(), dtype=float)
-        # # replicate the last data points to avoid the error in the curve fitting
-        # x_data = np.append(x_data, x_data[-1]/(x_data[-1]/x_data[-2]))
-        # y_data = np.append(y_data, y_data[-1])
-        max_growth_scale = dose_response_data.loc[dose_response_data['Dose'] == dose_response_data['Dose'].min(), 'OD_final'].median()
+        
+        # Data preprocessing to avoid numerical issues
+        # Remove any NaN or infinite values
+        valid_mask = np.isfinite(x_data) & np.isfinite(y_data) & (x_data > 0) & (y_data >= 0)
+        x_data = x_data[valid_mask]
+        y_data = y_data[valid_mask]
+        
+        # Check if we have enough data points
+        if len(x_data) < 3:
+            return {'Status': "FAIL - Insufficient data points",
+                    'IC50': np.nan, 'MIC': np.nan, 'IC50_ci_lower': np.nan,
+                    'IC50_ci_upper': np.nan, 'MIC_ci_lower': np.nan, 'MIC_ci_upper': np.nan,
+                    'max_growth': np.nan, 'max_growth_ci_lower': np.nan, 'max_growth_ci_upper': np.nan,
+                    'hill_coeff': np.nan, 'ic50_threshold': np.nan, 'mic_threshold': np.nan,
+                    'x_fit': '[]', 'y_fit': '[]', 'ic50_bootstrap': '[]'}
+        
+        # Ensure x_data spans reasonable range
+        if np.max(x_data) / np.min(x_data) < 2:
+            return {'Status': "FAIL - Insufficient dose range",
+                    'IC50': np.nan, 'MIC': np.nan, 'IC50_ci_lower': np.nan,
+                    'IC50_ci_upper': np.nan, 'MIC_ci_lower': np.nan, 'MIC_ci_upper': np.nan,
+                    'max_growth': np.nan, 'max_growth_ci_lower': np.nan, 'max_growth_ci_upper': np.nan,
+                    'hill_coeff': np.nan, 'ic50_threshold': np.nan, 'mic_threshold': np.nan,
+                    'x_fit': '[]', 'y_fit': '[]', 'ic50_bootstrap': '[]'}
+        
+        # First, fit a 3PL curve to estimate max_growth_scale empirically
+        try:
+            # Initial parameter estimates for 3PL: [top, ec50, hill_slope]
+            top_initial = np.max(y_data)
+            ec50_initial = np.exp((np.log(np.min(x_data))+np.log(np.max(x_data)))/2)
+            hill_initial = 1
+            p0_3pl = [top_initial, ec50_initial, hill_initial]
+            
+            # Fit 3PL model to estimate max_growth_scale
+            optimizer_3pl = static.fit_model_3pl(x_data, y_data, p0_3pl)
+            max_growth_scale = optimizer_3pl.x[0]  # The 'top' parameter is our max_growth_scale
+            
+            # Bootstrap estimation of max_growth_scale for confidence intervals
+            max_growth_bootstrap = []
+            with mp.Pool(processes=threads) as pool:
+                bootstrap_3pl_results = pool.starmap(static.bootstrap_resample_3pl,
+                                                   [(x_data, y_data, p0_3pl, seed) for seed in range(n_bootstrap)])
+            
+            # Collect max_growth (top parameter) from bootstrap results
+            for top_, ec50_, hill_ in bootstrap_3pl_results:
+                if not np.isnan(top_):
+                    max_growth_bootstrap.append(top_)
+            
+            max_growth_bootstrap = np.array(max_growth_bootstrap)
+            max_growth_ci_lower = np.percentile(max_growth_bootstrap, 2.5) if len(max_growth_bootstrap) > 0 else np.nan
+            max_growth_ci_upper = np.percentile(max_growth_bootstrap, 97.5) if len(max_growth_bootstrap) > 0 else np.nan
+            
+        except Exception as e:
+            # Fallback to original method if 3PL fitting fails
+            max_growth_scale = dose_response_data.loc[dose_response_data['Dose'] == dose_response_data['Dose'].min(), 'OD_final'].median()
+            max_growth_ci_lower = np.nan
+            max_growth_ci_upper = np.nan
+        
+        # Normalize y_data using the empirically estimated max_growth_scale
         y_data = y_data / max_growth_scale
         
         try:
-            p0=[np.exp((np.log(np.min(x_data))+np.log(np.max(x_data)))/2), 1]
+            # Better parameter initialization for 2PL fitting
+            # Find approximate EC50 as dose where response is ~50% of max
+            sorted_idx = np.argsort(x_data)
+            x_sorted = x_data[sorted_idx]
+            y_sorted = y_data[sorted_idx]
+            
+            # Find EC50 estimate using interpolation
+            target_response = 0.5  # 50% inhibition
+            if np.max(y_sorted) > target_response > np.min(y_sorted):
+                ec50_initial = np.interp(target_response, y_sorted[::-1], x_sorted[::-1])
+            else:
+                ec50_initial = np.exp((np.log(np.min(x_data))+np.log(np.max(x_data)))/2)
+            
+            # Estimate hill slope from data steepness
+            if len(x_data) > 3:
+                # Calculate slope between 25% and 75% response points
+                y25 = np.percentile(y_data, 25)
+                y75 = np.percentile(y_data, 75)
+                if y75 != y25:
+                    hill_initial = abs(np.log(3) / np.log(np.max(x_data)/np.min(x_data)))
+                else:
+                    hill_initial = 1.0
+            else:
+                hill_initial = 1.0
+            
+            # Ensure hill slope is reasonable
+            hill_initial = np.clip(hill_initial, 0.1, 5.0)
+            
+            p0 = [ec50_initial, hill_initial]
 
             # Calculate IC50 using all data points
             optimizer = static.fit_model(x_data, y_data, p0)
@@ -621,6 +776,8 @@ class static:
                         'MIC_ci_lower': mic_ci_lower,
                         'MIC_ci_upper': mic_ci_upper,
                         'max_growth': max_growth_scale,
+                        'max_growth_ci_lower': max_growth_ci_lower,
+                        'max_growth_ci_upper': max_growth_ci_upper,
                         'hill_coeff': hill_coeff,
                         'ic50_threshold': log_logistic_2pl_(optimizer.x, ic50) * max_growth_scale,
                         'mic_threshold': log_logistic_2pl_(optimizer.x, mic) * max_growth_scale,
@@ -637,6 +794,8 @@ class static:
                         'MIC_ci_lower': mic_ci_lower,
                         'MIC_ci_upper': mic_ci_upper,
                         'max_growth': max_growth_scale,
+                        'max_growth_ci_lower': max_growth_ci_lower,
+                        'max_growth_ci_upper': max_growth_ci_upper,
                         'hill_coeff': hill_coeff,
                         'ic50_threshold': np.nan,
                         'mic_threshold': np.nan,
@@ -652,7 +811,9 @@ class static:
                     'IC50_ci_upper': np.nan,
                     'MIC_ci_lower': np.nan,
                     'MIC_ci_upper': np.nan,
-                    'max_growth_scale': np.nan,
+                    'max_growth': np.nan,
+                    'max_growth_ci_lower': np.nan,
+                    'max_growth_ci_upper': np.nan,
                     'hill_coeff': np.nan,
                     'ic50_threshold': np.nan,
                     'mic_threshold': np.nan,

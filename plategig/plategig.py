@@ -6,7 +6,6 @@ import math
 import warnings
 from scipy.optimize import least_squares, fsolve
 import multiprocessing as mp
-from functools import partial
 from sklearn.base import BaseEstimator
 from sklearn.utils import check_random_state
 from tqdm import tqdm
@@ -203,73 +202,46 @@ class static:
             'n_trials_': trial + 1
         }
     
-    @staticmethod
-    def bootstrap_resample(x_data, y_data, p0, seed, mic_percentage=0.05, use_ransac=True):
-        """Bootstrap resampling for confidence intervals"""
-        np.random.seed(seed)
-        
-        # Resample the full curve (all data points with replacement)
-        n_samples = len(x_data)
-        resampled_indices = np.random.choice(n_samples, size=n_samples, replace=True)
-        
-        x_resampled = x_data[resampled_indices]
-        y_resampled = y_data[resampled_indices]
-        
-        try:
-            if use_ransac:
-                ransac_result = static.ransac_fit_3pl(x_resampled, y_resampled, p0, random_state=seed)
-                if ransac_result is None:
-                    return np.nan, np.nan, np.nan, np.nan
-                ic50, hill_coeff, max_growth = ransac_result['params']
-            else:
-                optimizer = static.fit_model(x_resampled, y_resampled, p0)
-                ic50, hill_coeff, max_growth = optimizer.x
-            
-            mic = log_logistic_3pl_solve(mic_percentage * max_growth, [ic50, hill_coeff, max_growth], ic50)[0]
-            return ic50, hill_coeff, mic, max_growth
-        except:
-            return np.nan, np.nan, np.nan, np.nan
+
+    
+
     
     @staticmethod
-    def prepare_dose_response_data(df_analysis, strain, antibiotic, replicate=""):
-        """Prepare dose-response data for analysis"""
-        # Filter data
-        data = df_analysis[
-            ((df_analysis['Antibiotic'] == antibiotic) |
-             (df_analysis['Antibiotic'].str.lower() == 'cells only')) &
-            (df_analysis['Strain'] == strain)
-        ]
+    def calculate_ic50_mic(df_analysis, combination_row, mic_percentage=0.05, use_ransac=True):
+        """Calculate IC50 and MIC for specific combination defined by all columns in combination_row"""
         
-        if replicate:
-            data = data[data['Replicate'] == replicate]
+        # Filter data based on all columns in combination_row
+        filtered_data = df_analysis.copy()
+        for col, val in combination_row.items():
+            if col in df_analysis.columns:
+                filtered_data = filtered_data[filtered_data[col] == val]
         
-        # Handle zero doses
-        nonzero_min = data['Dose'][data['Dose'] > 0].min()
-        log_min_dose = nonzero_min / 10 if not pd.isna(nonzero_min) else 0.01
-        data = data.copy()
-        data.loc[data['Dose'] == 0, 'Dose'] = log_min_dose
-        data.loc[data['Dose'] < nonzero_min, 'Dose'] = nonzero_min
+        # Also include 'cells only' antibiotic data
+        if 'Antibiotic' in combination_row:
+            cells_only_data = df_analysis[df_analysis['Antibiotic'].str.lower() == 'cells only']
+            # Filter cells only data by other columns except Antibiotic
+            for col, val in combination_row.items():
+                if col != 'Antibiotic' and col in cells_only_data.columns:
+                    cells_only_data = cells_only_data[cells_only_data[col] == val]
+            filtered_data = pd.concat([filtered_data, cells_only_data])
         
-        return data
-    
-    @staticmethod
-    def calculate_ic50_mic(df_analysis, antibiotic, strain, mic_percentage=0.05, 
-                          n_bootstrap=100, threads=16, use_ransac=True):
-        """Calculate IC50 and MIC with confidence intervals"""
-        
-        dose_response_data = static.prepare_dose_response_data(
-            df_analysis, strain, antibiotic)
-        
-        if dose_response_data.empty:
+        if filtered_data.empty:
             return static._create_fail_result()
         
-        x_data = dose_response_data['Dose'].to_numpy().astype(float)
-        y_data = dose_response_data['OD_final'].to_numpy().astype(float)
+        # Handle zero doses for log scale
+        nonzero_min = filtered_data['Dose'][filtered_data['Dose'] > 0].min()
+        log_min_dose = nonzero_min / 10 if not pd.isna(nonzero_min) else 0.01
+        filtered_data = filtered_data.copy()
+        filtered_data.loc[filtered_data['Dose'] == 0, 'Dose'] = log_min_dose
+        filtered_data.loc[filtered_data['Dose'] < nonzero_min, 'Dose'] = nonzero_min
+        
+        x_data = filtered_data['Dose'].to_numpy().astype(float)
+        y_data = filtered_data['OD_final'].to_numpy().astype(float)
         
         try:
             # Initial parameter guess: [ec50, hill_slope, max_growth]
-            max_growth_guess = dose_response_data.loc[
-                dose_response_data['Dose'] == dose_response_data['Dose'].min(), 
+            max_growth_guess = filtered_data.loc[
+                filtered_data['Dose'] == filtered_data['Dose'].min(), 
                 'OD_final'].median()
             p0 = [np.exp((np.log(np.min(x_data)) + np.log(np.max(x_data))) / 2), 1, max_growth_guess]
             
@@ -279,61 +251,30 @@ class static:
                 if ransac_result is None:
                     return static._create_fail_result("RANSAC fitting failed")
                 ic50, hill_coeff, max_growth = ransac_result['params']
-                inlier_mask = ransac_result['inlier_mask']
             else:
                 optimizer = static.fit_model(x_data, y_data, p0)
                 ic50, hill_coeff, max_growth = optimizer.x
-                inlier_mask = np.ones(len(x_data), dtype=bool)
             
-            # Bootstrap for confidence intervals
-            with mp.Pool(processes=threads) as pool:
-                results = pool.starmap(
-                    partial(static.bootstrap_resample, mic_percentage=mic_percentage, use_ransac=use_ransac),
-                    [(x_data, y_data, p0, seed) for seed in range(n_bootstrap)]
-                )
-            
-            # Process bootstrap results
-            ic50_bootstrap = [r[0] for r in results if not np.isnan(r[0])]
-            hill_bootstrap = [r[1] for r in results if not np.isnan(r[1])]
-            mic_bootstrap = [r[2] for r in results if not np.isnan(r[2])]
-            
-            if not ic50_bootstrap:
-                return static._create_fail_result()
-            
-            # Calculate confidence intervals
-            ic50_ci = np.percentile(ic50_bootstrap, [2.5, 97.5])
-            mic_ci = np.percentile(mic_bootstrap, [2.5, 97.5])
+            # Calculate MIC
+            params = [ic50, hill_coeff, max_growth]
+            mic = log_logistic_3pl_solve(mic_percentage * max_growth, params, ic50)[0]
             
             # Generate fit curve
             x_fit = np.logspace(np.log10(x_data.min()/2), np.log10(x_data.max()*2), 100)
-            params = [ic50, hill_coeff, max_growth]
             y_fit = log_logistic_3pl(params, x_fit)
-            
-            # Calculate MIC
-            mic = log_logistic_3pl_solve(mic_percentage * max_growth, params, ic50)[0]
             
             result_dict = {
                 'Status': 'PASS',
                 'IC50': ic50,
                 'MIC': mic,
-                'IC50_ci_lower': ic50_ci[0],
-                'IC50_ci_upper': ic50_ci[1],
-                'MIC_ci_lower': mic_ci[0],
-                'MIC_ci_upper': mic_ci[1],
                 'max_growth': max_growth,
                 'hill_coeff': hill_coeff,
                 'ic50_threshold': log_logistic_3pl(params, ic50),
                 'mic_threshold': log_logistic_3pl(params, mic),
                 'x_fit': json.dumps(x_fit.tolist()),
                 'y_fit': json.dumps(y_fit.tolist()),
-                'ic50_bootstrap': json.dumps(ic50_bootstrap),
                 'ransac_used': use_ransac
             }
-            
-            if use_ransac:
-                result_dict['n_inliers'] = np.sum(inlier_mask)
-                result_dict['n_outliers'] = len(inlier_mask) - np.sum(inlier_mask)
-                result_dict['outlier_fraction'] = result_dict['n_outliers'] / len(inlier_mask)
             
             return result_dict
             
@@ -347,35 +288,44 @@ class static:
             'Status': 'FAIL',
             'IC50': np.nan,
             'MIC': np.nan,
-            'IC50_ci_lower': np.nan,
-            'IC50_ci_upper': np.nan,
-            'MIC_ci_lower': np.nan,
-            'MIC_ci_upper': np.nan,
             'max_growth': np.nan,
             'hill_coeff': np.nan,
             'ic50_threshold': np.nan,
             'mic_threshold': np.nan,
             'x_fit': '[]',
             'y_fit': '[]',
-            'ic50_bootstrap': '[]',
             'ransac_used': False,
-            'n_inliers': np.nan,
-            'n_outliers': np.nan,
-            'outlier_fraction': np.nan,
             'error': error
         }
     
     @staticmethod
-    def apply_phenotyper(df_analysis, valid_combinations):
+    def _process_combination(args):
+        """Helper function for multiprocessing"""
+        df_analysis, row = args
+        return static.calculate_ic50_mic(df_analysis, row)
+    
+    @staticmethod
+    def apply_phenotyper(df_analysis, valid_combinations, threads=8):
         """Apply phenotyping to all valid strain-antibiotic combinations"""
         df_phenotyped = valid_combinations.copy()
         
-        for ix, row in tqdm(valid_combinations.iterrows(), total=len(valid_combinations), desc="Processing combinations"):
-            result = static.calculate_ic50_mic(
-                df_analysis, row['Antibiotic'], row['Strain'])
-            
+        # Prepare arguments for multiprocessing
+        args_list = [(df_analysis, row) for _, row in valid_combinations.iterrows()]
+        
+        # Process with multiprocessing
+        with mp.Pool(processes=threads) as pool:
+            results = list(tqdm(
+                pool.imap(static._process_combination, args_list),
+                total=len(valid_combinations),
+                desc="Processing combinations"
+            ))
+        
+        # Assign results back to dataframe
+        for ix, result in enumerate(results):
             for key, val in result.items():
-                df_phenotyped.loc[ix, key] = val
+                if key not in df_phenotyped.columns:
+                    df_phenotyped[key] = np.nan
+                df_phenotyped.iloc[ix, df_phenotyped.columns.get_loc(key)] = val
         
         return df_phenotyped
     
@@ -394,9 +344,7 @@ class static:
                         allowed_cap = max(x_fit) * median_fold_change**2
                         
                         if allowed_cap < row['IC50']:
-                            capped.loc[ix, ['IC50', 'MIC', 'IC50_ci_upper', 
-                                          'IC50_ci_lower', 'MIC_ci_upper', 
-                                          'MIC_ci_lower']] = allowed_cap
+                            capped.loc[ix, ['IC50', 'MIC']] = allowed_cap
                             capped.loc[ix, 'insufficient_drug'] = True
                 except:
                     continue
@@ -496,14 +444,22 @@ class static:
             fig, ax = plt.subplots(figsize=(6, 4), dpi=100)
         
         # Get experimental data
-        filtered_data = static.prepare_dose_response_data(df_analysis, strain, antibiotic)
+        filtered_data = df_analysis[
+            ((df_analysis['Antibiotic'] == antibiotic) |
+             (df_analysis['Antibiotic'].str.lower() == 'cells only')) &
+            (df_analysis['Strain'] == strain)
+        ]
+        
+        if replicate:
+            filtered_data = filtered_data[filtered_data['Replicate'] == replicate]
+        
         color = strain_colors.get(strain.lower(), 'gray')
         
         # Plot experimental points
         if not filtered_data.empty:
             filtered_data = filtered_data.sort_values(by='Dose')
             ax.semilogx(filtered_data['Dose'], filtered_data['OD_final'], 
-                       'x', markersize=4, color=color, markerfacecolor='none', 
+                       'o', markersize=6, color=color, markerfacecolor='none', 
                        label=f'Data')
         
         # Get fitted results
@@ -525,7 +481,7 @@ class static:
             y_fit = json.loads(result.get('y_fit', '[]'))
             
             if x_fit and y_fit:
-                ax.semilogx(x_fit, y_fit, '--', color='black', alpha=0.5, label='Fit')
+                ax.semilogx(x_fit, y_fit, '-', color='black', alpha=0.5, label='Fit')
         except:
             pass
         
@@ -554,16 +510,17 @@ class static:
         # Add vertical/horizontal lines for IC50/MIC
         try:
             if not np.isnan(ic50) and not np.isnan(result.get('ic50_threshold', np.nan)):
-                ax.axvline(x=ic50, color='magenta', linestyle=':', alpha=0.7)
-                ax.axhline(y=result['ic50_threshold'], color='magenta', linestyle=':', alpha=0.7)
+                ax.axvline(x=ic50, color='magenta', linestyle=':', alpha=0.5)
+                ax.axhline(y=result['ic50_threshold'], color='magenta', linestyle=':', alpha=0.5)
             
             if not np.isnan(mic) and not np.isnan(result.get('mic_threshold', np.nan)):
-                ax.axvline(x=mic, color='blue', linestyle=':', alpha=0.7)
-                ax.axhline(y=result['mic_threshold'], color='blue', linestyle=':', alpha=0.7)
+                ax.axvline(x=mic, color='blue', linestyle=':', alpha=0.5)
+                ax.axhline(y=result['mic_threshold'], color='blue', linestyle=':', alpha=0.5)
         except:
             pass
         
-        ax.text(0.02, 0.96, f'{strain}', transform=ax.transAxes, fontsize=9, va='top')
+        # ax.text(0.02, 0.96, f'{strain}', transform=ax.transAxes, fontsize=9, va='top')
+        ax.set_title(f'{strain} {int(replicate)}')
         ax.grid(False)
 
     @staticmethod

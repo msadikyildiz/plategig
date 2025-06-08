@@ -12,6 +12,7 @@ dependencies:
   - altair
   - vl-convert-python
   - scipy
+  - scikit-learn
   - jupyter
   - ipykernel
   - notebook

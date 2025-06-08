@@ -1,0 +1,21 @@
+name: plategig-env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - pandas
+  - openpyxl
+  - numpy
+  - matplotlib
+  - seaborn
+  - altair
+  - vl-convert-python
+  - scipy
+  - jupyter
+  - ipykernel
+  - notebook
+  - tqdm
+  - pip
+  - pip:
+      - -e .   # Editable install of your local package

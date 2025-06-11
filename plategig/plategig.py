@@ -6,7 +6,6 @@ import math
 import warnings
 from scipy.optimize import least_squares, fsolve
 import multiprocessing as mp
-from sklearn.base import BaseEstimator
 from sklearn.utils import check_random_state
 from tqdm import tqdm
 
@@ -94,14 +93,23 @@ class static:
     @staticmethod
     def process_doses_for_log_scale(filtered_data):
         """Handle zero doses for log scale by replacing them with estimated minimum value"""
+        # Create a copy of the input DataFrame to avoid modifying the original
         filtered_data = filtered_data.copy()
+        # Fill NaN values in the 'Dose' column with 0
         filtered_data['Dose'] = filtered_data['Dose'].fillna(0)
+        # Find the minimum non-zero dose value
         nonzero_min = filtered_data['Dose'][filtered_data['Dose'] > 0].min()
+        # Get unique non-zero doses and sort them
         nonzero_doses = sorted(filtered_data['Dose'][filtered_data['Dose'] > 0].unique())
+        # Calculate fold changes between consecutive non-zero doses
         fold_changes = [nonzero_doses[i+1]/nonzero_doses[i] for i in range(len(nonzero_doses)-1)]
+        # Calculate the median fold change, default to 10 if no fold changes exist
         median_fold = np.median(fold_changes) if fold_changes else 10
+        # Calculate the estimated minimum dose for log scale
         log_min_dose = nonzero_min / median_fold
+        # Replace doses smaller than the minimum non-zero dose with the estimated minimum dose
         filtered_data.loc[filtered_data['Dose'] < nonzero_min, 'Dose'] = log_min_dose
+        # Return the processed DataFrame
         return filtered_data
 
     @staticmethod
